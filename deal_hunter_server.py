@@ -30,10 +30,12 @@ TARGET = {
     "chip": "M5",
     "memory": 24,
     "storage": 1024,
-    "color": "Midnight",
-             "Starlight",
-             "Silver", 
-             "Sky Blue",
+    "colors": {
+        "Midnight",
+        "Starlight",
+        "Silver",
+        "Sky Blue",
+    },
 }
 
 USER_AGENT = (
