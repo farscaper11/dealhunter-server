@@ -334,12 +334,13 @@ def send_discord_group(
     color_lines = []
 
     for product in sorted_products:
-        color_lines.append(
-            f"{availability_icon(product['availability'])} "
-            f"[{product['color']} — ${product['price']:,.0f}]"
-            f"({product['url']})"
-        )
+    clean_url = product["url"].split("?", 1)[0]
 
+    color_lines.append(
+        f"{availability_icon(product['availability'])} "
+        f"[{product['color']} — ${product['price']:,.0f}]"
+        f"({clean_url})"
+    )
     reason_lines = []
     seen_reasons = set()
 
@@ -367,7 +368,7 @@ def send_discord_group(
                     "15-inch MacBook Air M5 — "
                     "24 GB / 1 TB"
                 ),
-                "url": best["url"],
+                "url": best["url"].split("?", 1)[0],
                 "description": (
                     "**Apple Certified Refurbished**\n"
                     "Every link below was opened and verified "
