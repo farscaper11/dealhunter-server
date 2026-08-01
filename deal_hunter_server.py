@@ -31,6 +31,9 @@ TARGET = {
     "memory": 24,
     "storage": 1024,
     "color": "Midnight",
+             "Starlight",
+             "Silver", 
+             "Sky Blue",
 }
 
 USER_AGENT = (
@@ -463,7 +466,7 @@ def scan_product_page(page, url: str) -> dict:
             product["chip"] == TARGET["chip"],
             product["memory"] == TARGET["memory"],
             product["storage"] == TARGET["storage"],
-            product["color"].lower() == TARGET["color"].lower(),
+            product["color"] in TARGET["colors"],
             product["price"] is not None,
         ]
     )
