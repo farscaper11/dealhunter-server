@@ -33,6 +33,17 @@ STATE_FILE = DATA_DIR / "alert-state.json"
 RESULTS_FILE = DATA_DIR / "last-results.json"
 SCAN_FILE = DATA_DIR / "last-scan.txt"
 CACHE_FILE = DATA_DIR / "product-cache.json"
+PRICE_HISTORY_FILE = DATA_DIR / "price-history.json"
+
+REFERENCE_PRICE = max(
+    1.0,
+    float(os.getenv("DH_REFERENCE_PRICE", "1999")),
+)
+
+HISTORY_MAX_POINTS = max(
+    10,
+    int(os.getenv("DH_HISTORY_MAX_POINTS", "200")),
+)
 
 TARGET = {
     "screen": 15.0,
@@ -59,10 +70,10 @@ RETAILER_ORDER = {
     "Best Buy": 1,
 }
 
-GROUP_ALERT_VERSION = 2
+GROUP_ALERT_VERSION = 3
 
 USER_AGENT = (
-    "DealHunter/0.5 "
+    "DealHunter/0.6 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -110,6 +121,242 @@ def save_cache(cache: dict) -> None:
         json.dumps(cache, indent=2),
         encoding="utf-8",
     )
+
+
+def load_price_history() -> dict:
+    try:
+        data = json.loads(
+            PRICE_HISTORY_FILE.read_text(encoding="utf-8")
+        )
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_price_history(history: dict) -> None:
+    PRICE_HISTORY_FILE.write_text(
+        json.dumps(history, indent=2),
+        encoding="utf-8",
+    )
+
+
+def deal_tier(score: int) -> str:
+    if score >= 90:
+        return "Exceptional"
+    if score >= 80:
+        return "Excellent"
+    if score >= 70:
+        return "Good"
+    if score >= 55:
+        return "Fair"
+    return "Wait"
+
+
+def record_price_history(
+    products: list[dict],
+    history: dict,
+    checked_at: str,
+) -> int:
+    points_added = 0
+
+    for product in products:
+        url = canonical_url(product.get("url", ""))
+        price = product.get("price")
+
+        if not url or price is None:
+            continue
+
+        try:
+            price = float(price)
+        except (TypeError, ValueError):
+            continue
+
+        entry = history.get(url)
+        if not isinstance(entry, dict):
+            entry = {}
+
+        points = entry.get("points", [])
+        if not isinstance(points, list):
+            points = []
+
+        availability = product.get("availability", "Unknown")
+
+        last_point = points[-1] if points else {}
+        price_changed = (
+            not points
+            or last_point.get("price") != price
+        )
+        availability_changed = (
+            not points
+            or last_point.get("availability") != availability
+        )
+
+        if price_changed or availability_changed:
+            points.append(
+                {
+                    "checked_at": checked_at,
+                    "price": price,
+                    "availability": availability,
+                }
+            )
+            points_added += 1
+
+        points = points[-HISTORY_MAX_POINTS:]
+
+        previous_low = entry.get("low_price")
+        previous_high = entry.get("high_price")
+
+        numeric_low = (
+            float(previous_low)
+            if isinstance(previous_low, (int, float))
+            else price
+        )
+        numeric_high = (
+            float(previous_high)
+            if isinstance(previous_high, (int, float))
+            else price
+        )
+
+        try:
+            checks = int(entry.get("checks", 0)) + 1
+        except (TypeError, ValueError):
+            checks = 1
+
+        history[url] = {
+            "retailer": product.get("retailer"),
+            "condition": product.get("condition"),
+            "title": product.get("title"),
+            "color": product.get("color"),
+            "first_seen": entry.get("first_seen") or checked_at,
+            "last_seen": checked_at,
+            "checks": checks,
+            "low_price": min(numeric_low, price),
+            "high_price": max(numeric_high, price),
+            "latest_price": price,
+            "latest_availability": availability,
+            "points": points,
+        }
+
+    return points_added
+
+
+def apply_deal_metrics(
+    products: list[dict],
+    history: dict,
+) -> None:
+    for product in products:
+        url = canonical_url(product.get("url", ""))
+        entry = history.get(url, {})
+
+        if not isinstance(entry, dict):
+            entry = {}
+
+        try:
+            price = float(product["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        low_price = entry.get("low_price", price)
+        high_price = entry.get("high_price", price)
+
+        try:
+            low_price = float(low_price)
+        except (TypeError, ValueError):
+            low_price = price
+
+        try:
+            high_price = float(high_price)
+        except (TypeError, ValueError):
+            high_price = price
+
+        try:
+            checks = int(entry.get("checks", 1))
+        except (TypeError, ValueError):
+            checks = 1
+
+        points = entry.get("points", [])
+        if not isinstance(points, list):
+            points = []
+
+        distinct_prices = {
+            point.get("price")
+            for point in points
+            if isinstance(point, dict)
+            and isinstance(point.get("price"), (int, float))
+        }
+
+        savings_amount = max(0.0, REFERENCE_PRICE - price)
+        savings_percent = (
+            savings_amount / REFERENCE_PRICE * 100
+        )
+
+        savings_points = min(
+            40.0,
+            max(0.0, savings_percent * 2.0),
+        )
+
+        if len(distinct_prices) < 2:
+            history_points = 15.0
+            history_label = "Building history"
+        else:
+            above_low_percent = (
+                max(0.0, price - low_price)
+                / max(low_price, 1.0)
+                * 100
+            )
+
+            if above_low_percent <= 0.01:
+                history_points = 30.0
+                history_label = "Historical low"
+            elif above_low_percent <= 2:
+                history_points = 24.0
+                history_label = "Within 2% of low"
+            elif above_low_percent <= 5:
+                history_points = 16.0
+                history_label = "Within 5% of low"
+            elif above_low_percent <= 10:
+                history_points = 8.0
+                history_label = "Within 10% of low"
+            else:
+                history_points = 0.0
+                history_label = "Above recent low"
+
+        availability = product.get("availability")
+
+        if availability == "Likely in stock":
+            availability_points = 20.0
+        elif availability == "Unknown":
+            availability_points = 8.0
+        else:
+            availability_points = 0.0
+
+        verification_points = (
+            10.0 if product.get("exact_match") else 0.0
+        )
+
+        score = round(
+            min(
+                100.0,
+                savings_points
+                + history_points
+                + availability_points
+                + verification_points,
+            )
+        )
+
+        product.update(
+            {
+                "reference_price": REFERENCE_PRICE,
+                "savings_amount": round(savings_amount, 2),
+                "savings_percent": round(savings_percent, 1),
+                "historical_low": round(low_price, 2),
+                "historical_high": round(high_price, 2),
+                "history_checks": checks,
+                "history_label": history_label,
+                "deal_score": score,
+                "deal_tier": deal_tier(score),
+            }
+        )
 
 
 def normalize_state_urls(state: dict) -> None:
@@ -397,6 +644,7 @@ def send_discord_group(
         retailer_products = sorted(
             grouped[retailer],
             key=lambda item: (
+                -item.get("deal_score", 0),
                 item["price"],
                 COLOR_ORDER.get(item["color"], 99),
             ),
@@ -413,7 +661,10 @@ def send_discord_group(
         for product in retailer_products:
             listing_lines.append(
                 f"{availability_icon(product['availability'])} "
-                f"[{product['color']} — ${product['price']:,.0f}]"
+                f"[{product['color']} — "
+                f"${product['price']:,.0f} • "
+                f"{product.get('deal_score', 0)}/100 "
+                f"{product.get('deal_tier', '')}]"
                 f"({canonical_url(product['url'])})"
             )
 
@@ -424,7 +675,7 @@ def send_discord_group(
             if product.get("retailer") != retailer:
                 continue
 
-            if reason == "Multi-retailer alert enabled":
+            if reason == "Deal scoring enabled":
                 reason_text = reason
             else:
                 reason_text = f"{reason}: {product['color']}"
@@ -444,14 +695,31 @@ def send_discord_group(
             for product in retailer_products
         )
 
+        history_value = (
+            f"Low ${best.get('historical_low', best['price']):,.0f} • "
+            f"High ${best.get('historical_high', best['price']):,.0f}\n"
+            f"{best.get('history_label', 'Building history')} • "
+            f"{best.get('history_checks', 1)} verified checks"
+        )
+
+        savings_value = (
+            f"${best.get('savings_amount', 0):,.0f} "
+            f"({best.get('savings_percent', 0):.1f}%) below "
+            f"${best.get('reference_price', REFERENCE_PRICE):,.0f} reference"
+        )
+
         embeds.append(
             {
-                "title": f"{retailer} — ${best_price:,.0f} best",
+                "title": (
+                    f"{retailer} — ${best_price:,.0f} best • "
+                    f"{best.get('deal_score', 0)}/100 "
+                    f"{best.get('deal_tier', '')}"
+                ),
                 "url": canonical_url(best["url"]),
                 "description": (
                     f"**{condition}**\n"
-                    "Every link below was opened and verified "
-                    "against the retailer product page."
+                    "Every listing was independently verified "
+                    "from the retailer's live product data."
                 ),
                 "fields": [
                     {
@@ -460,14 +728,27 @@ def send_discord_group(
                         "inline": True,
                     },
                     {
-                        "name": "Verified colors",
-                        "value": str(len(retailer_products)),
+                        "name": "Deal score",
+                        "value": (
+                            f"{best.get('deal_score', 0)}/100 • "
+                            f"{best.get('deal_tier', '')}"
+                        ),
                         "inline": True,
                     },
                     {
                         "name": "Availability",
                         "value": f"{in_stock} in stock",
                         "inline": True,
+                    },
+                    {
+                        "name": "Price history",
+                        "value": history_value[:1024],
+                        "inline": False,
+                    },
+                    {
+                        "name": "Savings context",
+                        "value": savings_value[:1024],
+                        "inline": False,
                     },
                     {
                         "name": "Choose a listing",
@@ -482,7 +763,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.5 • "
+                        "Deal Hunter Server 0.6 • "
                         f"{len(retailer_products)} verified listings"
                     )
                 },
@@ -517,6 +798,7 @@ def send_discord_group(
         timeout=20,
     ) as response:
         log(f"Discord returned HTTP {response.status}.")
+
 
 def scan_apple_product_page(page, url: str) -> dict:
     page.goto(
@@ -626,6 +908,7 @@ def scan() -> None:
     normalize_state_urls(state)
 
     cache = load_cache()
+    price_history = load_price_history()
     results = []
     exact_products = []
     triggered = []
@@ -937,6 +1220,16 @@ def scan() -> None:
             previous["availability"] = "Out of stock"
             previous["last_seen"] = checked_at
 
+    history_points_added = record_price_history(
+        exact_products,
+        price_history,
+        checked_at,
+    )
+    apply_deal_metrics(
+        exact_products,
+        price_history,
+    )
+
     force_group_alert = (
         state.get("__group_alert_version__")
         != GROUP_ALERT_VERSION
@@ -966,7 +1259,7 @@ def scan() -> None:
                 grouped_reasons.append(
                     (
                         product,
-                        "Multi-retailer alert enabled",
+                        "Deal scoring enabled",
                     )
                 )
                 retailers_with_reasons.add(retailer)
@@ -986,6 +1279,8 @@ def scan() -> None:
                 "retailer": product.get("retailer"),
                 "price": product["price"],
                 "availability": product["availability"],
+                "deal_score": product.get("deal_score"),
+                "historical_low": product.get("historical_low"),
                 "last_seen": product["checked_at"],
             }
 
@@ -996,6 +1291,7 @@ def scan() -> None:
 
     save_state(state)
     save_cache(cache)
+    save_price_history(price_history)
 
     RESULTS_FILE.write_text(
         json.dumps(results, indent=2),
@@ -1023,6 +1319,16 @@ def scan() -> None:
         f"Apple exact matches: {apple_matches}",
         f"Best Buy exact matches: {best_buy_matches}",
         f"Total exact matches: {len(exact_products)}",
+        f"Price history points added: {history_points_added}",
+        (
+            "Best deal score: "
+            + (
+                f"{max(product.get('deal_score', 0) for product in exact_products)}"
+                f"/100"
+                if exact_products
+                else "n/a"
+            )
+        ),
         (
             "Grouped alert sent: "
             f"{'yes' if alert_needed and alert_sent else 'no'}"
@@ -1044,7 +1350,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.5 starting.")
+    log("Deal Hunter Server 0.6 starting.")
 
     if not WEBHOOK_URL:
         log(
