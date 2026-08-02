@@ -3,6 +3,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from urllib import request
 
@@ -16,6 +17,11 @@ INTERVAL_MINUTES = max(
     int(os.getenv("DH_SCAN_INTERVAL_MINUTES", "15")),
 )
 
+FULL_REVERIFY_HOURS = max(
+    1,
+    int(os.getenv("DH_FULL_REVERIFY_HOURS", "6")),
+)
+
 DATA_DIR = Path(os.getenv("DH_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -24,6 +30,7 @@ WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 STATE_FILE = DATA_DIR / "alert-state.json"
 RESULTS_FILE = DATA_DIR / "last-results.json"
 SCAN_FILE = DATA_DIR / "last-scan.txt"
+CACHE_FILE = DATA_DIR / "product-cache.json"
 
 TARGET = {
     "screen": 15.0,
@@ -48,7 +55,7 @@ COLOR_ORDER = {
 GROUP_ALERT_VERSION = 1
 
 USER_AGENT = (
-    "DealHunter/0.3 "
+    "DealHunter/0.4 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -60,6 +67,43 @@ def log(message: str) -> None:
 
 def compact(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def canonical_url(url: str) -> str:
+    return (url or "").split("?", 1)[0]
+
+
+def catalog_fingerprint(text: str) -> str:
+    normalized = compact(text).lower()
+    return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def load_cache() -> dict:
+    try:
+        data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cache(cache: dict) -> None:
+    CACHE_FILE.write_text(
+        json.dumps(cache, indent=2),
+        encoding="utf-8",
+    )
+
+
+def normalize_state_urls(state: dict) -> None:
+    for key in list(state):
+        if not key.startswith("http") or "?" not in key:
+            continue
+
+        clean_key = canonical_url(key)
+
+        if clean_key not in state:
+            state[clean_key] = state[key]
+
+        del state[key]
 
 
 def product_information(text: str) -> str:
@@ -334,7 +378,7 @@ def send_discord_group(
     color_lines = []
 
     for product in sorted_products:
-        clean_url = product["url"].split("?", 1)[0]
+        clean_url = canonical_url(product["url"])
 
         color_lines.append(
             f"{availability_icon(product['availability'])} "
@@ -368,7 +412,7 @@ def send_discord_group(
                     "15-inch MacBook Air M5 — "
                     "24 GB / 1 TB"
                 ),
-                "url": best["url"].split("?", 1)[0],
+                "url": canonical_url(best["url"]),
                 "description": (
                     "**Apple Certified Refurbished**\n"
                     "Every link below was opened and verified "
@@ -408,7 +452,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.3 • "
+                        "Deal Hunter Server 0.4 • "
                         f"{len(sorted_products)} verified listings"
                     )
                 },
@@ -504,7 +548,7 @@ def scan_product_page(page, url: str) -> dict:
         "title": str(
             structured_product.get("name") or title
         ),
-        "url": page.url.split("?", 1)[0],
+        "url": canonical_url(page.url),
         "screen": detect_screen(authoritative_text),
         "chip": detect_chip(authoritative_text),
         "memory": detect_memory(overview),
@@ -539,9 +583,19 @@ def scan() -> None:
     log("Opening Apple refurbished catalog.")
 
     state = load_state()
+    normalize_state_urls(state)
+
+    cache = load_cache()
     results = []
     exact_products = []
     triggered = []
+
+    pages_opened = 0
+    cached_pages = 0
+    now_epoch = time.time()
+    checked_at = datetime.now().astimezone().isoformat(
+        timespec="seconds"
+    )
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -572,11 +626,10 @@ def scan() -> None:
 
         page.wait_for_timeout(2500)
 
-        links = page.evaluate(
+        raw_links = page.evaluate(
             """
             () => {
               const results = [];
-              const seen = new Set();
 
               for (
                 const link of document.querySelectorAll(
@@ -585,7 +638,7 @@ def scan() -> None:
               ) {
                 const url = link.href;
 
-                if (!url || seen.has(url)) continue;
+                if (!url) continue;
 
                 const container =
                   link.closest(
@@ -603,8 +656,6 @@ def scan() -> None:
                 if (!/15(?:\\.3)?[- ]?inch/i.test(text)) continue;
                 if (!/\\bm5\\b/i.test(text)) continue;
 
-                seen.add(url);
-
                 results.push({
                   url,
                   text
@@ -616,40 +667,138 @@ def scan() -> None:
             """
         )
 
+        links = []
+        seen_urls = set()
+
+        for link in raw_links:
+            clean_url = canonical_url(link.get("url", ""))
+
+            if not clean_url or clean_url in seen_urls:
+                continue
+
+            seen_urls.add(clean_url)
+
+            links.append(
+                {
+                    "url": clean_url,
+                    "text": link.get("text", ""),
+                }
+            )
+
+        catalog_urls = {
+            link["url"]
+            for link in links
+        }
+
         log(
             f"Found {len(links)} candidate product pages."
         )
 
         for index, link in enumerate(links, start=1):
+            url = link["url"]
+            fingerprint = catalog_fingerprint(link["text"])
+
+            cached_entry = cache.get(url, {})
+            cached_product = cached_entry.get("product")
+
             try:
-                log(
-                    f"Checking product {index}/{len(links)}."
+                last_verified_epoch = float(
+                    cached_entry.get(
+                        "last_verified_epoch",
+                        0,
+                    )
                 )
+            except (TypeError, ValueError):
+                last_verified_epoch = 0
 
-                product = scan_product_page(
-                    page,
-                    link["url"],
-                )
+            cache_age_seconds = (
+                now_epoch - last_verified_epoch
+            )
 
-                results.append(product)
+            cache_is_stale = (
+                cache_age_seconds
+                >= FULL_REVERIFY_HOURS * 3600
+            )
 
-                if not product["exact_match"]:
+            exact_cached_product = bool(
+                isinstance(cached_product, dict)
+                and cached_product.get("exact_match")
+            )
+
+            catalog_changed = (
+                cached_entry.get("catalog_fingerprint")
+                != fingerprint
+            )
+
+            should_open = (
+                not isinstance(cached_product, dict)
+                or catalog_changed
+                or exact_cached_product
+                or cache_is_stale
+            )
+
+            if should_open:
+                try:
+                    log(
+                        f"Opening product {index}/{len(links)}."
+                    )
+
+                    product = scan_product_page(
+                        page,
+                        url,
+                    )
+
+                    pages_opened += 1
+
+                    cache[url] = {
+                        "catalog_fingerprint": fingerprint,
+                        "last_verified_epoch": time.time(),
+                        "product": product,
+                    }
+
+                except Exception as exc:
+                    log(
+                        f"Product page failed: "
+                        f"{url}: {exc}"
+                    )
                     continue
 
-                exact_products.append(product)
+            else:
+                product = dict(cached_product)
+                product["catalog_checked_at"] = checked_at
+                cached_pages += 1
 
-                reason = should_alert(product, state)
+            results.append(product)
 
-                if reason:
-                    triggered.append((product, reason))
+            if not product.get("exact_match"):
+                continue
 
-            except Exception as exc:
-                log(
-                    f"Product page failed: "
-                    f"{link['url']}: {exc}"
-                )
+            exact_products.append(product)
+
+            reason = should_alert(product, state)
+
+            if reason:
+                triggered.append((product, reason))
 
         browser.close()
+
+    for key in list(cache):
+        if key not in catalog_urls:
+            del cache[key]
+
+    for key, previous in list(state.items()):
+        if not key.startswith("http"):
+            continue
+
+        if key in catalog_urls:
+            continue
+
+        if not isinstance(previous, dict):
+            continue
+
+        if previous.get("availability") == "Likely in stock":
+            previous["availability"] = "Out of stock"
+            previous["last_seen"] = checked_at
 
     force_group_alert = (
         state.get("__group_alert_version__")
@@ -696,6 +845,7 @@ def scan() -> None:
             )
 
     save_state(state)
+    save_cache(cache)
 
     RESULTS_FILE.write_text(
         json.dumps(results, indent=2),
@@ -708,6 +858,8 @@ def scan() -> None:
         f"Checked: "
         f"{datetime.now().astimezone().isoformat()}\n"
         f"Candidate pages: {len(links)}\n"
+        f"Product pages opened: {pages_opened}\n"
+        f"Cached pages reused: {cached_pages}\n"
         f"Exact matches: {exact_count}\n"
         f"Grouped alert sent: "
         f"{'yes' if alert_needed and alert_sent else 'no'}\n"
@@ -721,7 +873,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.3 starting.")
+    log("Deal Hunter Server 0.4 starting.")
 
     if not WEBHOOK_URL:
         log(
