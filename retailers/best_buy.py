@@ -1,10 +1,12 @@
-
 import re
 from datetime import datetime
 
 
 RETAILER = "Best Buy"
-CATALOG_URL = "https://www.bestbuy.com/site/promo/macbook-air-m5"
+CATALOG_URL = (
+    "https://www.bestbuy.com/site/searchpage.jsp"
+    "?id=pcat17071&st=macbook+air+m5+24gb+1tb"
+)
 
 TARGET = {
     "screen": 15.0,
@@ -166,6 +168,12 @@ def discover_candidates(page) -> list[dict]:
         pass
 
     page.wait_for_timeout(2500)
+
+    for _ in range(4):
+        page.evaluate(
+            "window.scrollTo(0, document.body.scrollHeight)"
+        )
+        page.wait_for_timeout(750)
 
     body_text = page.locator("body").inner_text(timeout=15000)
     if "access denied" in body_text.lower():
