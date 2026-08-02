@@ -1,5 +1,3 @@
-import html
-import json
 import re
 from datetime import datetime
 
@@ -23,20 +21,10 @@ TARGET = {
     },
 }
 
-REQUEST_HEADERS = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/136.0.0.0 Safari/537.36"
-    ),
-}
+# Refreshed by discover_candidates() on every scan. This lets verification
+# use Best Buy's live search-result card instead of the product endpoint,
+# which currently fails from the TrueNAS container with HTTP/2/time-out errors.
+_CANDIDATE_CACHE: dict[str, dict] = {}
 
 
 def compact(text: str) -> str:
@@ -96,7 +84,11 @@ def detect_storage(text: str) -> int | None:
         return None
 
     value = int(match.group(1))
-    return {1000: 1024, 2000: 2048, 4000: 4096}.get(value, value)
+    return {
+        1000: 1024,
+        2000: 2048,
+        4000: 4096,
+    }.get(value, value)
 
 
 def detect_color(text: str) -> str:
@@ -114,39 +106,41 @@ def detect_color(text: str) -> str:
     return ""
 
 
-def extract_best_buy_price(visible_text: str) -> float | None:
-    normalized = compact(visible_text[:30000])
+def extract_best_buy_price(card_text: str) -> float | None:
+    normalized = compact(card_text)
 
-    patterns = (
-        (
-            r"Sold by Best Buy\s+\$\s*"
-            r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)"
-        ),
-        (
-            r"SKU:\s*\d+.*?Sold by Best Buy.*?\$\s*"
-            r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)"
-        ),
+    # Exclude comparison/MSRP text so it cannot be mistaken for the live price.
+    live_price_section = re.split(
+        r"\b(?:The comparable value is|Comp\.?\s*Value|Was Price)\b",
+        normalized,
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+
+    values: list[float] = []
+
+    for raw in re.findall(
         r"\$\s*([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
-    )
-
-    for pattern in patterns:
-        match = re.search(pattern, normalized, re.I)
-        if not match:
-            continue
-
+        live_price_section,
+    ):
         try:
-            value = float(match.group(1).replace(",", ""))
+            value = float(raw.replace(",", ""))
         except ValueError:
             continue
 
         if 500 <= value <= 5000:
-            return value
+            values.append(value)
 
-    return None
+    if not values:
+        return None
+
+    # Best Buy often renders the current price twice. min() also handles
+    # a lower member/deal price appearing alongside the regular price.
+    return min(values)
 
 
-def detect_availability(visible_text: str) -> str:
-    normalized = compact(visible_text[:30000]).lower()
+def detect_availability(card_text: str) -> str:
+    normalized = compact(card_text).lower()
 
     if any(
         phrase in normalized
@@ -155,23 +149,37 @@ def detect_availability(visible_text: str) -> str:
             "currently unavailable",
             "sold out",
             "this item is unavailable",
-            "out of stock",
+            "unavailable nearby",
         )
     ):
         return "Out of stock"
 
-    if any(
-        phrase in normalized
-        for phrase in (
-            "add to cart",
-            "add to basket",
-            "get it today",
-            "shipping available",
-        )
-    ):
+    if "add to cart" in normalized:
         return "Likely in stock"
 
     return "Unknown"
+
+
+def sold_by_best_buy(card_text: str) -> bool:
+    normalized = compact(card_text)
+
+    seller_match = re.search(
+        r"\bSold by\s+(.{1,80}?)(?:\s{2,}|Add to cart|$)",
+        normalized,
+        re.I,
+    )
+
+    if seller_match:
+        return seller_match.group(1).strip().lower().startswith("best buy")
+
+    # On Best Buy's first-party search cards, no seller label is shown.
+    # Marketplace cards identify the outside seller. A direct Best Buy card
+    # with an Add to cart control and no third-party seller marker is treated
+    # as first-party inventory.
+    return (
+        "add to cart" in normalized.lower()
+        and "marketplace" not in normalized.lower()
+    )
 
 
 def discover_candidates(page) -> list[dict]:
@@ -189,7 +197,9 @@ def discover_candidates(page) -> list[dict]:
     page.wait_for_timeout(2500)
 
     for _ in range(4):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.evaluate(
+            "window.scrollTo(0, document.body.scrollHeight)"
+        )
         page.wait_for_timeout(750)
 
     body_text = page.locator("body").inner_text(timeout=15000)
@@ -203,37 +213,63 @@ def discover_candidates(page) -> list[dict]:
 
           for (
             const link of document.querySelectorAll(
-              'a[href*="/product/"]'
+              'a.product-list-item-link[href*="/product/"], '
+              + 'a[href*="/product/"]'
             )
           ) {
-            const url = link.href;
-            if (!url) continue;
+            const card =
+              link.closest('.sku-block') ||
+              link.closest('li.product-list-item') ||
+              link.closest('li, article');
 
-            const container =
-              link.closest(
-                'li, article, [class*="product"], [class*="sku"], [class*="card"]'
-              ) || link.parentElement;
+            if (!card) continue;
+
+            const titleElement =
+              card.querySelector('h3.product-title') ||
+              card.querySelector('[data-testid="product-title"]');
+
+            const title = (
+              titleElement?.getAttribute('title') ||
+              titleElement?.innerText ||
+              link.getAttribute('aria-label') ||
+              link.innerText ||
+              ''
+            ).replace(/\\s+/g, ' ').trim();
 
             const text = (
-              container?.innerText ||
-              link.innerText ||
-              link.getAttribute("aria-label") ||
-              ""
-            ).trim();
+              card.innerText || ''
+            ).replace(/\\s+/g, ' ').trim();
 
-            if (!/macbook air/i.test(text)) continue;
-            if (!/15(?:\\.3)?[- ]?inch/i.test(text)) continue;
-            if (!/\\bm5\\b/i.test(text)) continue;
-            if (!/24\\s*gb\\s*(?:memory|ram)/i.test(text)) continue;
-            if (!/1\\s*tb\\s*ssd/i.test(text)) continue;
+            const combined = `${title} ${text}`;
 
-            results.push({url, text});
+            if (!/macbook air/i.test(combined)) continue;
+            if (!/15(?:\\.3)?[- ]?inch/i.test(combined)) continue;
+            if (!/\\bm5\\b/i.test(combined)) continue;
+            if (!/24\\s*gb\\s*(?:memory|ram)/i.test(combined)) continue;
+            if (!/1\\s*tb\\s*ssd/i.test(combined)) continue;
+
+            const buttons = [...card.querySelectorAll('button')]
+              .map(button => (
+                button.innerText ||
+                button.getAttribute('aria-label') ||
+                ''
+              ).replace(/\\s+/g, ' ').trim())
+              .filter(Boolean);
+
+            results.push({
+              url: link.href,
+              title,
+              text,
+              buttons
+            });
           }
 
           return results;
         }
         """
     )
+
+    _CANDIDATE_CACHE.clear()
 
     candidates = []
     seen_urls = set()
@@ -244,161 +280,67 @@ def discover_candidates(page) -> list[dict]:
             continue
 
         seen_urls.add(url)
+
+        normalized = {
+            "retailer": RETAILER,
+            "url": url,
+            "title": compact(candidate.get("title", "")),
+            "text": compact(candidate.get("text", "")),
+            "buttons": [
+                compact(button)
+                for button in candidate.get("buttons", [])
+                if compact(button)
+            ],
+        }
+
+        _CANDIDATE_CACHE[url] = normalized
+
         candidates.append(
             {
                 "retailer": RETAILER,
                 "url": url,
-                "text": compact(candidate.get("text", "")),
+                "text": normalized["text"],
             }
         )
 
     return candidates
 
 
-def _walk_json(value):
-    if isinstance(value, list):
-        for item in value:
-            yield from _walk_json(item)
-        return
+def verify_product(page, url: str) -> dict:
+    clean_url = canonical_url(url)
+    candidate = _CANDIDATE_CACHE.get(clean_url)
 
-    if not isinstance(value, dict):
-        return
+    if candidate is None:
+        discover_candidates(page)
+        candidate = _CANDIDATE_CACHE.get(clean_url)
 
-    raw_type = value.get("@type", [])
-    types = raw_type if isinstance(raw_type, list) else [raw_type]
+    if candidate is None:
+        raise RuntimeError(
+            "Best Buy listing disappeared from the live search results"
+        )
 
-    if any(str(item).lower() == "product" for item in types):
-        yield value
+    title = candidate["title"]
+    card_text = candidate["text"]
 
-    for item in value.values():
-        yield from _walk_json(item)
+    if candidate["buttons"]:
+        card_text = compact(
+            f"{card_text} {' '.join(candidate['buttons'])}"
+        )
 
-
-def _extract_json_ld_product(raw_html: str) -> dict:
-    scripts = re.findall(
-        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>"
-        r"(.*?)</script>",
-        raw_html or "",
-        re.I | re.S,
-    )
-
-    for script in scripts:
-        try:
-            data = json.loads(html.unescape(script).strip())
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-
-        for product in _walk_json(data):
-            combined = " ".join(
-                str(product.get(key, ""))
-                for key in ("name", "description", "sku", "mpn")
-            )
-            if "macbook air" in combined.lower():
-                return product
-
-    return {}
-
-
-def _offers(product: dict) -> list[dict]:
-    offers = product.get("offers", [])
-    if isinstance(offers, dict):
-        return [offers]
-    if isinstance(offers, list):
-        return [offer for offer in offers if isinstance(offer, dict)]
-    return []
-
-
-def _price_from_structured(product: dict) -> float | None:
-    prices = []
-
-    for offer in _offers(product):
-        for key in ("price", "lowPrice"):
-            raw_value = offer.get(key)
-            try:
-                value = float(
-                    str(raw_value).replace("$", "").replace(",", "")
-                )
-            except (TypeError, ValueError):
-                continue
-
-            if 500 <= value <= 5000:
-                prices.append(value)
-
-    unique = sorted(set(prices))
-    return unique[0] if len(unique) == 1 else None
-
-
-def _availability_from_structured(product: dict) -> str:
-    values = [
-        str(offer.get("availability", "")).lower()
-        for offer in _offers(product)
-    ]
-    combined = " ".join(values)
-
-    if "outofstock" in combined or "soldout" in combined:
-        return "Out of stock"
-
-    if "instock" in combined or "limitedavailability" in combined:
-        return "Likely in stock"
-
-    return "Unknown"
-
-
-def _seller_is_best_buy_structured(product: dict) -> bool:
-    seller_names = []
-
-    for offer in _offers(product):
-        seller = offer.get("seller")
-        if isinstance(seller, dict):
-            seller_names.append(str(seller.get("name", "")))
-        elif seller:
-            seller_names.append(str(seller))
-
-    return any("best buy" in name.lower() for name in seller_names)
-
-
-def _text_from_html(raw_html: str) -> str:
-    cleaned = re.sub(
-        r"<(script|style)\b[^>]*>.*?</\1>",
-        " ",
-        raw_html or "",
-        flags=re.I | re.S,
-    )
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-    return compact(html.unescape(cleaned))
-
-
-def _title_from_html(raw_html: str) -> str:
-    match = re.search(
-        r"<title[^>]*>(.*?)</title>",
-        raw_html or "",
-        re.I | re.S,
-    )
-    return compact(html.unescape(match.group(1))) if match else ""
-
-
-def _build_product(
-    *,
-    title: str,
-    url: str,
-    authoritative_text: str,
-    price: float | None,
-    availability: str,
-    seller_is_best_buy: bool,
-) -> dict:
     product = {
         "retailer": RETAILER,
         "condition": "New",
         "title": title,
-        "url": canonical_url(url),
+        "url": clean_url,
         "screen": detect_screen(title),
         "chip": detect_chip(title),
         "memory": detect_memory(title),
         "storage": detect_storage(title),
         "color": detect_color(title),
-        "price": price,
-        "availability": availability,
-        "sold_by_retailer": seller_is_best_buy,
+        "price": extract_best_buy_price(card_text),
+        "availability": detect_availability(card_text),
+        "sold_by_retailer": sold_by_best_buy(card_text),
+        "verification_source": "Best Buy live search-result card",
         "checked_at": datetime.now()
         .astimezone()
         .isoformat(timespec="seconds"),
@@ -406,7 +348,7 @@ def _build_product(
 
     product["exact_match"] = all(
         [
-            "macbook air" in authoritative_text.lower(),
+            "macbook air" in title.lower(),
             product["screen"] is not None
             and abs(product["screen"] - TARGET["screen"]) <= 0.4,
             product["chip"] == TARGET["chip"],
@@ -419,107 +361,3 @@ def _build_product(
     )
 
     return product
-
-
-def _verify_from_html(raw_html: str, requested_url: str) -> dict:
-    structured_product = _extract_json_ld_product(raw_html)
-    visible_text = _text_from_html(raw_html)
-
-    title = compact(
-        str(structured_product.get("name", ""))
-        or _title_from_html(raw_html)
-    )
-    authoritative_text = f"{title} {visible_text[:30000]}"
-
-    seller_is_best_buy = (
-        _seller_is_best_buy_structured(structured_product)
-        or "sold by best buy" in visible_text[:30000].lower()
-        or "best buy" in raw_html[:100000].lower()
-    )
-
-    price = _price_from_structured(structured_product)
-    if price is None:
-        price = extract_best_buy_price(visible_text)
-
-    availability = _availability_from_structured(structured_product)
-    if availability == "Unknown":
-        availability = detect_availability(visible_text)
-
-    return _build_product(
-        title=title,
-        url=requested_url,
-        authoritative_text=authoritative_text,
-        price=price,
-        availability=availability,
-        seller_is_best_buy=seller_is_best_buy,
-    )
-
-
-def _request_product_html(page, url: str) -> str:
-    response = page.context.request.get(
-        url,
-        headers=REQUEST_HEADERS,
-        timeout=60000,
-        fail_on_status_code=False,
-    )
-
-    if response.status >= 400:
-        raise RuntimeError(
-            f"Best Buy fallback request returned HTTP {response.status}"
-        )
-
-    raw_html = response.text()
-
-    if "access denied" in raw_html.lower():
-        raise RuntimeError("Best Buy fallback returned access denied")
-
-    return raw_html
-
-
-def verify_product(page, url: str) -> dict:
-    navigation_error = None
-
-    try:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-    except Exception as exc:
-        navigation_error = exc
-        if "ERR_HTTP2_PROTOCOL_ERROR" not in str(exc):
-            raise
-
-    if navigation_error is None:
-        try:
-            page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            pass
-
-        page.wait_for_timeout(1800)
-        visible_text = page.locator("body").inner_text(timeout=15000)
-
-        if "access denied" not in visible_text.lower():
-            try:
-                title = compact(
-                    page.locator("h1").first.inner_text(timeout=5000)
-                )
-            except Exception:
-                title = compact(page.title())
-
-            authoritative_text = f"{title} {visible_text[:30000]}"
-            seller_is_best_buy = (
-                "sold by best buy" in visible_text[:30000].lower()
-            )
-
-            return _build_product(
-                title=title,
-                url=page.url,
-                authoritative_text=authoritative_text,
-                price=extract_best_buy_price(visible_text),
-                availability=detect_availability(visible_text),
-                seller_is_best_buy=seller_is_best_buy,
-            )
-
-    raw_html = _request_product_html(page, url)
-    return _verify_from_html(raw_html, url)
