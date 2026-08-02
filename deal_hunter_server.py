@@ -504,7 +504,7 @@ def scan_product_page(page, url: str) -> dict:
         "title": str(
             structured_product.get("name") or title
         ),
-        "url": page.url,
+        "url": page.url.split("?", 1)[0],
         "screen": detect_screen(authoritative_text),
         "chip": detect_chip(authoritative_text),
         "memory": detect_memory(overview),
