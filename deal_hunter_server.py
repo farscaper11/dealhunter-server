@@ -9,7 +9,7 @@ from urllib import request
 
 from playwright.sync_api import sync_playwright
 
-from retailers import best_buy, bh_photo
+from retailers import amazon, best_buy
 
 
 APPLE_CATALOG_URL = "https://www.apple.com/shop/refurbished/mac"
@@ -23,16 +23,6 @@ FULL_REVERIFY_HOURS = max(
     1,
     int(os.getenv("DH_FULL_REVERIFY_HOURS", "6")),
 )
-
-ENABLE_BH = os.getenv(
-    "DH_ENABLE_BH",
-    "false",
-).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
 
 DATA_DIR = Path(os.getenv("DH_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -91,13 +81,13 @@ COLOR_ORDER = {
 RETAILER_ORDER = {
     "Apple Certified Refurbished": 0,
     "Best Buy": 1,
-    "B&H Photo": 2,
+    "Amazon": 2,
 }
 
 GROUP_ALERT_VERSION = 3
 
 USER_AGENT = (
-    "DealHunter/0.8.1 "
+    "DealHunter/0.9 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -126,8 +116,8 @@ def retailer_for_url(url: str) -> str:
     if "bestbuy.com" in lowered:
         return "Best Buy"
 
-    if "bhphotovideo.com" in lowered:
-        return "B&H Photo"
+    if "amazon.com" in lowered:
+        return "Amazon"
 
     if "apple.com" in lowered:
         return "Apple Certified Refurbished"
@@ -849,7 +839,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.8.1 • "
+                        "Deal Hunter Server 0.9 • "
                         f"{len(retailer_products)} verified listings"
                     )
                 },
@@ -1148,52 +1138,44 @@ def scan() -> None:
             source_errors.append(message)
             log(message)
 
-        if ENABLE_BH:
-            bh_context = browser.new_context(
-                locale="en-US",
-                viewport={
-                    "width": 1440,
-                    "height": 1100,
-                },
+        amazon_context = browser.new_context(
+            locale="en-US",
+            viewport={
+                "width": 1440,
+                "height": 1100,
+            },
+        )
+        amazon_page = amazon_context.new_page()
+
+        try:
+            amazon_candidates = amazon.discover_candidates(
+                amazon_page
             )
-            bh_page = bh_context.new_page()
 
-            try:
-                bh_candidates = bh_photo.discover_candidates(
-                    bh_page
+            for candidate in amazon_candidates:
+                candidates.append(
+                    {
+                        "adapter": "amazon",
+                        "retailer": candidate.get(
+                            "retailer",
+                            "Amazon",
+                        ),
+                        "url": candidate.get("url", ""),
+                        "text": candidate.get("text", ""),
+                        "page": amazon_page,
+                    }
                 )
 
-                for candidate in bh_candidates:
-                    candidates.append(
-                        {
-                            "adapter": "bh_photo",
-                            "retailer": candidate.get(
-                                "retailer",
-                                "B&H Photo",
-                            ),
-                            "url": canonical_url(
-                                candidate.get("url", "")
-                            ),
-                            "text": candidate.get("text", ""),
-                            "page": bh_page,
-                        }
-                    )
-
-                successful_retailers.add("B&H Photo")
-                log(
-                    f"B&H candidates: "
-                    f"{len(bh_candidates)}."
-                )
-
-            except Exception as exc:
-                message = f"B&H catalog failed: {exc}"
-                source_errors.append(message)
-                log(message)
-        else:
+            successful_retailers.add("Amazon")
             log(
-                "B&H source disabled: Cloudflare verification "
-                "blocks server-side access."
+                f"Amazon candidates: "
+                f"{len(amazon_candidates)}."
             )
+
+        except Exception as exc:
+            message = f"Amazon catalog failed: {exc}"
+            source_errors.append(message)
+            log(message)
 
         deduped_candidates = []
         seen_urls = set()
@@ -1277,8 +1259,8 @@ def scan() -> None:
                             candidate["page"],
                             url,
                         )
-                    elif candidate["adapter"] == "bh_photo":
-                        product = bh_photo.verify_product(
+                    elif candidate["adapter"] == "amazon":
+                        product = amazon.verify_product(
                             candidate["page"],
                             url,
                         )
@@ -1467,8 +1449,8 @@ def scan() -> None:
         product.get("retailer") == "Best Buy"
         for product in exact_products
     )
-    bh_matches = sum(
-        product.get("retailer") == "B&H Photo"
+    amazon_matches = sum(
+        product.get("retailer") == "Amazon"
         for product in exact_products
     )
 
@@ -1482,7 +1464,7 @@ def scan() -> None:
         f"Cached pages reused: {cached_pages}",
         f"Apple exact matches: {apple_matches}",
         f"Best Buy exact matches: {best_buy_matches}",
-        f"B&H exact matches: {bh_matches}",
+        f"Amazon exact matches: {amazon_matches}",
         f"Total exact matches: {len(exact_products)}",
         f"Price history points added: {history_points_added}",
         f"Alert score threshold: {ALERT_MIN_SCORE}/100",
@@ -1518,7 +1500,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.8.1 starting.")
+    log("Deal Hunter Server 0.9 starting.")
 
     if not WEBHOOK_URL:
         log(
