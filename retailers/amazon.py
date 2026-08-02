@@ -394,6 +394,7 @@ def discover_candidates(page) -> list[dict]:
 
     for item in variant_data:
         asin = compact(item.get("asin", "")).upper()
+        label = compact(item.get("label", ""))
 
         if not re.fullmatch(r"[A-Z0-9]{10}", asin):
             continue
@@ -401,13 +402,29 @@ def discover_candidates(page) -> list[dict]:
         if asin in seen_asins:
             continue
 
+        # Amazon exposes unrelated memory/storage variants in the same
+        # variation group. Reject variants that are clearly not 24 GB / 1 TB.
+        # Blank labels are retained because Amazon often hides sibling-color
+        # text until that ASIN is opened.
+        if label:
+            lowered = label.lower()
+
+            if re.search(r"\b(?:8|16|18|32|36|48|64|96|128)\s*gb\b", lowered):
+                continue
+
+            if re.search(r"\b(?:256|512)\s*gb\b", lowered):
+                continue
+
+            if "24gb" in lowered.replace(" ", "") and "1tb" not in lowered.replace(" ", ""):
+                continue
+
         seen_asins.add(asin)
 
         candidates.append(
             {
                 "retailer": RETAILER,
                 "url": f"https://www.amazon.com/dp/{asin}",
-                "text": compact(item.get("label", "")),
+                "text": label,
             }
         )
 
@@ -428,70 +445,111 @@ def discover_candidates(page) -> list[dict]:
 
 
 def verify_product(page, url: str) -> dict:
-    page.goto(
-        canonical_url(url),
-        wait_until="domcontentloaded",
-        timeout=60000,
+    browser = page.context.browser
+
+    if browser is None:
+        raise RuntimeError("Amazon verification requires a browser context")
+
+    # Amazon soft-redirects reused automated sessions to a generic homepage.
+    # A fresh context per ASIN matches the successful TrueNAS diagnostic.
+    fresh_context = browser.new_context(
+        locale="en-US",
+        viewport={"width": 1440, "height": 1100},
     )
+    fresh_page = fresh_context.new_page()
 
     try:
-        page.wait_for_load_state("networkidle", timeout=12000)
-    except Exception:
-        pass
-
-    page.wait_for_timeout(1800)
-
-    visible_text = page.locator("body").inner_text(timeout=15000)
-    raise_for_challenge(page, visible_text)
-
-    try:
-        title = compact(
-            page.locator("#productTitle").first.inner_text(timeout=5000)
+        fresh_page.goto(
+            canonical_url(url),
+            wait_until="domcontentloaded",
+            timeout=60000,
         )
-    except Exception:
-        title = compact(page.title())
 
-    seller, shipper = seller_and_shipper(page, visible_text)
-    price = extract_buy_box_price(page, visible_text)
-    availability = detect_availability(page, visible_text)
+        try:
+            fresh_page.wait_for_load_state(
+                "networkidle",
+                timeout=12000,
+            )
+        except Exception:
+            pass
 
-    product = {
-        "retailer": RETAILER,
-        "condition": "New",
-        "title": title,
-        "url": canonical_url(page.url),
-        "asin": asin_from_url(page.url),
-        "screen": detect_screen(title),
-        "chip": detect_chip(title),
-        "memory": detect_memory(title),
-        "storage": detect_storage(title),
-        "color": detect_color(title),
-        "price": price,
-        "availability": availability,
-        "seller": seller,
-        "shipper": shipper,
-        "sold_by_retailer": seller == "Amazon.com",
-        "shipped_by_retailer": shipper == "Amazon.com",
-        "verification_source": "Amazon live new-offer buy box",
-        "checked_at": datetime.now()
-        .astimezone()
-        .isoformat(timespec="seconds"),
-    }
+        fresh_page.wait_for_timeout(1800)
 
-    product["exact_match"] = all(
-        [
-            "macbook air" in title.lower(),
-            product["screen"] is not None
-            and abs(product["screen"] - TARGET["screen"]) <= 0.4,
-            product["chip"] == TARGET["chip"],
-            product["memory"] == TARGET["memory"],
-            product["storage"] == TARGET["storage"],
-            product["color"] in TARGET["colors"],
-            product["price"] is not None,
-            product["availability"] == "Likely in stock",
-            product["sold_by_retailer"],
-            product["shipped_by_retailer"],
-        ]
-    )
+        visible_text = fresh_page.locator("body").inner_text(
+            timeout=15000
+        )
+        raise_for_challenge(fresh_page, visible_text)
 
-    return product
+        try:
+            title = compact(
+                fresh_page.locator("#productTitle")
+                .first
+                .inner_text(timeout=5000)
+            )
+        except Exception:
+            title = compact(fresh_page.title())
+
+        if title.lower() == "amazon.com":
+            raise RuntimeError(
+                "Amazon returned a generic homepage instead of the product"
+            )
+
+        seller, shipper = seller_and_shipper(
+            fresh_page,
+            visible_text,
+        )
+        price = extract_buy_box_price(
+            fresh_page,
+            visible_text,
+        )
+        availability = detect_availability(
+            fresh_page,
+            visible_text,
+        )
+
+        product = {
+            "retailer": RETAILER,
+            "condition": "New",
+            "title": title,
+            "url": canonical_url(fresh_page.url),
+            "asin": asin_from_url(fresh_page.url),
+            "screen": detect_screen(title),
+            "chip": detect_chip(title),
+            "memory": detect_memory(title),
+            "storage": detect_storage(title),
+            "color": detect_color(title),
+            "price": price,
+            "availability": availability,
+            "seller": seller,
+            "shipper": shipper,
+            "sold_by_retailer": seller == "Amazon.com",
+            "shipped_by_retailer": shipper == "Amazon.com",
+            "verification_source": (
+                "Amazon live new-offer buy box "
+                "(fresh browser context)"
+            ),
+            "checked_at": datetime.now()
+            .astimezone()
+            .isoformat(timespec="seconds"),
+        }
+
+        product["exact_match"] = all(
+            [
+                "macbook air" in title.lower(),
+                product["screen"] is not None
+                and abs(product["screen"] - TARGET["screen"]) <= 0.4,
+                product["chip"] == TARGET["chip"],
+                product["memory"] == TARGET["memory"],
+                product["storage"] == TARGET["storage"],
+                product["color"] in TARGET["colors"],
+                product["price"] is not None,
+                product["availability"] == "Likely in stock",
+                product["sold_by_retailer"],
+                product["shipped_by_retailer"],
+            ]
+        )
+
+        return product
+
+    finally:
+        fresh_context.close()
