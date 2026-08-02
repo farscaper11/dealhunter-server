@@ -1,3 +1,5 @@
+import html
+import json
 import re
 from datetime import datetime
 
@@ -19,6 +21,21 @@ TARGET = {
         "Silver",
         "Sky Blue",
     },
+}
+
+REQUEST_HEADERS = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/136.0.0.0 Safari/537.36"
+    ),
 }
 
 
@@ -79,13 +96,7 @@ def detect_storage(text: str) -> int | None:
         return None
 
     value = int(match.group(1))
-    if value == 1000:
-        return 1024
-    if value == 2000:
-        return 2048
-    if value == 4000:
-        return 4096
-    return value
+    return {1000: 1024, 2000: 2048, 4000: 4096}.get(value, value)
 
 
 def detect_color(text: str) -> str:
@@ -104,36 +115,38 @@ def detect_color(text: str) -> str:
 
 
 def extract_best_buy_price(visible_text: str) -> float | None:
-    normalized = compact(visible_text[:18000])
+    normalized = compact(visible_text[:30000])
 
-    match = re.search(
-        r"Sold by Best Buy\s+\$\s*"
-        r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
-        normalized,
-        re.I,
+    patterns = (
+        (
+            r"Sold by Best Buy\s+\$\s*"
+            r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)"
+        ),
+        (
+            r"SKU:\s*\d+.*?Sold by Best Buy.*?\$\s*"
+            r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)"
+        ),
+        r"\$\s*([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
     )
 
-    if not match:
-        match = re.search(
-            r"SKU:\s*\d+.*?Sold by Best Buy.*?\$\s*"
-            r"([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
-            normalized,
-            re.I,
-        )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.I)
+        if not match:
+            continue
 
-    if not match:
-        return None
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except ValueError:
+            continue
 
-    try:
-        value = float(match.group(1).replace(",", ""))
-    except ValueError:
-        return None
+        if 500 <= value <= 5000:
+            return value
 
-    return value if 500 <= value <= 5000 else None
+    return None
 
 
 def detect_availability(visible_text: str) -> str:
-    normalized = compact(visible_text[:18000]).lower()
+    normalized = compact(visible_text[:30000]).lower()
 
     if any(
         phrase in normalized
@@ -142,13 +155,19 @@ def detect_availability(visible_text: str) -> str:
             "currently unavailable",
             "sold out",
             "this item is unavailable",
+            "out of stock",
         )
     ):
         return "Out of stock"
 
-    if (
-        "sold by best buy" in normalized
-        and "add to cart" in normalized
+    if any(
+        phrase in normalized
+        for phrase in (
+            "add to cart",
+            "add to basket",
+            "get it today",
+            "shipping available",
+        )
     ):
         return "Likely in stock"
 
@@ -170,9 +189,7 @@ def discover_candidates(page) -> list[dict]:
     page.wait_for_timeout(2500)
 
     for _ in range(4):
-        page.evaluate(
-            "window.scrollTo(0, document.body.scrollHeight)"
-        )
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(750)
 
     body_text = page.locator("body").inner_text(timeout=15000)
@@ -238,44 +255,149 @@ def discover_candidates(page) -> list[dict]:
     return candidates
 
 
-def verify_product(page, url: str) -> dict:
-    page.goto(
-        url,
-        wait_until="domcontentloaded",
-        timeout=60000,
+def _walk_json(value):
+    if isinstance(value, list):
+        for item in value:
+            yield from _walk_json(item)
+        return
+
+    if not isinstance(value, dict):
+        return
+
+    raw_type = value.get("@type", [])
+    types = raw_type if isinstance(raw_type, list) else [raw_type]
+
+    if any(str(item).lower() == "product" for item in types):
+        yield value
+
+    for item in value.values():
+        yield from _walk_json(item)
+
+
+def _extract_json_ld_product(raw_html: str) -> dict:
+    scripts = re.findall(
+        r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>"
+        r"(.*?)</script>",
+        raw_html or "",
+        re.I | re.S,
     )
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=12000)
-    except Exception:
-        pass
+    for script in scripts:
+        try:
+            data = json.loads(html.unescape(script).strip())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
 
-    page.wait_for_timeout(1800)
+        for product in _walk_json(data):
+            combined = " ".join(
+                str(product.get(key, ""))
+                for key in ("name", "description", "sku", "mpn")
+            )
+            if "macbook air" in combined.lower():
+                return product
 
-    visible_text = page.locator("body").inner_text(timeout=15000)
-    if "access denied" in visible_text.lower():
-        raise RuntimeError("Best Buy returned an access-denied page")
+    return {}
 
-    try:
-        title = compact(page.locator("h1").first.inner_text(timeout=5000))
-    except Exception:
-        title = compact(page.title())
 
-    authoritative_text = f"{title} {visible_text[:18000]}"
-    seller_is_best_buy = "sold by best buy" in visible_text[:18000].lower()
+def _offers(product: dict) -> list[dict]:
+    offers = product.get("offers", [])
+    if isinstance(offers, dict):
+        return [offers]
+    if isinstance(offers, list):
+        return [offer for offer in offers if isinstance(offer, dict)]
+    return []
 
+
+def _price_from_structured(product: dict) -> float | None:
+    prices = []
+
+    for offer in _offers(product):
+        for key in ("price", "lowPrice"):
+            raw_value = offer.get(key)
+            try:
+                value = float(
+                    str(raw_value).replace("$", "").replace(",", "")
+                )
+            except (TypeError, ValueError):
+                continue
+
+            if 500 <= value <= 5000:
+                prices.append(value)
+
+    unique = sorted(set(prices))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _availability_from_structured(product: dict) -> str:
+    values = [
+        str(offer.get("availability", "")).lower()
+        for offer in _offers(product)
+    ]
+    combined = " ".join(values)
+
+    if "outofstock" in combined or "soldout" in combined:
+        return "Out of stock"
+
+    if "instock" in combined or "limitedavailability" in combined:
+        return "Likely in stock"
+
+    return "Unknown"
+
+
+def _seller_is_best_buy_structured(product: dict) -> bool:
+    seller_names = []
+
+    for offer in _offers(product):
+        seller = offer.get("seller")
+        if isinstance(seller, dict):
+            seller_names.append(str(seller.get("name", "")))
+        elif seller:
+            seller_names.append(str(seller))
+
+    return any("best buy" in name.lower() for name in seller_names)
+
+
+def _text_from_html(raw_html: str) -> str:
+    cleaned = re.sub(
+        r"<(script|style)\b[^>]*>.*?</\1>",
+        " ",
+        raw_html or "",
+        flags=re.I | re.S,
+    )
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    return compact(html.unescape(cleaned))
+
+
+def _title_from_html(raw_html: str) -> str:
+    match = re.search(
+        r"<title[^>]*>(.*?)</title>",
+        raw_html or "",
+        re.I | re.S,
+    )
+    return compact(html.unescape(match.group(1))) if match else ""
+
+
+def _build_product(
+    *,
+    title: str,
+    url: str,
+    authoritative_text: str,
+    price: float | None,
+    availability: str,
+    seller_is_best_buy: bool,
+) -> dict:
     product = {
         "retailer": RETAILER,
         "condition": "New",
         "title": title,
-        "url": canonical_url(page.url),
+        "url": canonical_url(url),
         "screen": detect_screen(title),
         "chip": detect_chip(title),
         "memory": detect_memory(title),
         "storage": detect_storage(title),
         "color": detect_color(title),
-        "price": extract_best_buy_price(visible_text),
-        "availability": detect_availability(visible_text),
+        "price": price,
+        "availability": availability,
         "sold_by_retailer": seller_is_best_buy,
         "checked_at": datetime.now()
         .astimezone()
@@ -297,3 +419,107 @@ def verify_product(page, url: str) -> dict:
     )
 
     return product
+
+
+def _verify_from_html(raw_html: str, requested_url: str) -> dict:
+    structured_product = _extract_json_ld_product(raw_html)
+    visible_text = _text_from_html(raw_html)
+
+    title = compact(
+        str(structured_product.get("name", ""))
+        or _title_from_html(raw_html)
+    )
+    authoritative_text = f"{title} {visible_text[:30000]}"
+
+    seller_is_best_buy = (
+        _seller_is_best_buy_structured(structured_product)
+        or "sold by best buy" in visible_text[:30000].lower()
+        or "best buy" in raw_html[:100000].lower()
+    )
+
+    price = _price_from_structured(structured_product)
+    if price is None:
+        price = extract_best_buy_price(visible_text)
+
+    availability = _availability_from_structured(structured_product)
+    if availability == "Unknown":
+        availability = detect_availability(visible_text)
+
+    return _build_product(
+        title=title,
+        url=requested_url,
+        authoritative_text=authoritative_text,
+        price=price,
+        availability=availability,
+        seller_is_best_buy=seller_is_best_buy,
+    )
+
+
+def _request_product_html(page, url: str) -> str:
+    response = page.context.request.get(
+        url,
+        headers=REQUEST_HEADERS,
+        timeout=60000,
+        fail_on_status_code=False,
+    )
+
+    if response.status >= 400:
+        raise RuntimeError(
+            f"Best Buy fallback request returned HTTP {response.status}"
+        )
+
+    raw_html = response.text()
+
+    if "access denied" in raw_html.lower():
+        raise RuntimeError("Best Buy fallback returned access denied")
+
+    return raw_html
+
+
+def verify_product(page, url: str) -> dict:
+    navigation_error = None
+
+    try:
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+    except Exception as exc:
+        navigation_error = exc
+        if "ERR_HTTP2_PROTOCOL_ERROR" not in str(exc):
+            raise
+
+    if navigation_error is None:
+        try:
+            page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            pass
+
+        page.wait_for_timeout(1800)
+        visible_text = page.locator("body").inner_text(timeout=15000)
+
+        if "access denied" not in visible_text.lower():
+            try:
+                title = compact(
+                    page.locator("h1").first.inner_text(timeout=5000)
+                )
+            except Exception:
+                title = compact(page.title())
+
+            authoritative_text = f"{title} {visible_text[:30000]}"
+            seller_is_best_buy = (
+                "sold by best buy" in visible_text[:30000].lower()
+            )
+
+            return _build_product(
+                title=title,
+                url=page.url,
+                authoritative_text=authoritative_text,
+                price=extract_best_buy_price(visible_text),
+                availability=detect_availability(visible_text),
+                seller_is_best_buy=seller_is_best_buy,
+            )
+
+    raw_html = _request_product_html(page, url)
+    return _verify_from_html(raw_html, url)
