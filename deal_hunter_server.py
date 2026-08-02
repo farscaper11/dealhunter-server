@@ -45,6 +45,19 @@ HISTORY_MAX_POINTS = max(
     int(os.getenv("DH_HISTORY_MAX_POINTS", "200")),
 )
 
+ALERT_MIN_SCORE = min(
+    100,
+    max(
+        0,
+        int(os.getenv("DH_ALERT_MIN_SCORE", "70")),
+    ),
+)
+
+ALERT_SCORE_IMPROVEMENT = max(
+    1,
+    int(os.getenv("DH_ALERT_SCORE_IMPROVEMENT", "5")),
+)
+
 TARGET = {
     "screen": 15.0,
     "chip": "M5",
@@ -73,7 +86,7 @@ RETAILER_ORDER = {
 GROUP_ALERT_VERSION = 3
 
 USER_AGENT = (
-    "DealHunter/0.6 "
+    "DealHunter/0.7 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -588,14 +601,35 @@ def save_state(state: dict) -> None:
     )
 
 
+def numeric_score(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def should_alert(product: dict, state: dict) -> str | None:
     previous = state.get(product["url"])
+    current_score = numeric_score(product.get("deal_score"))
+    current_price = product.get("price")
+    current_availability = product.get(
+        "availability",
+        "Unknown",
+    )
 
     if previous is None:
-        return "New exact match"
+        if (
+            current_availability == "Likely in stock"
+            and current_score >= ALERT_MIN_SCORE
+        ):
+            return (
+                f"New {product.get('deal_tier', 'qualified')} "
+                f"deal ({current_score}/100)"
+            )
+
+        return None
 
     previous_price = previous.get("price")
-    current_price = product.get("price")
 
     if (
         previous_price is not None
@@ -606,9 +640,32 @@ def should_alert(product: dict, state: dict) -> str | None:
 
     if (
         previous.get("availability") != "Likely in stock"
-        and product.get("availability") == "Likely in stock"
+        and current_availability == "Likely in stock"
     ):
         return "Back in stock"
+
+    previous_score = numeric_score(
+        previous.get("deal_score")
+    )
+
+    if (
+        current_availability == "Likely in stock"
+        and current_score >= ALERT_MIN_SCORE
+    ):
+        if previous_score < ALERT_MIN_SCORE:
+            return (
+                f"Deal score reached {current_score}/100 "
+                f"{product.get('deal_tier', '')}".strip()
+            )
+
+        if (
+            current_score - previous_score
+            >= ALERT_SCORE_IMPROVEMENT
+        ):
+            return (
+                f"Deal score improved from "
+                f"{previous_score}/100 to {current_score}/100"
+            )
 
     return None
 
@@ -629,10 +686,22 @@ def send_discord_group(
         log("Discord webhook is not configured.")
         return
 
+    triggered_retailers = {
+        product.get("retailer", "Unknown retailer")
+        for product, _ in triggered
+    }
+
     grouped: dict[str, list[dict]] = {}
 
     for product in products:
         retailer = product.get("retailer", "Unknown retailer")
+
+        if (
+            triggered_retailers
+            and retailer not in triggered_retailers
+        ):
+            continue
+
         grouped.setdefault(retailer, []).append(product)
 
     embeds = []
@@ -675,7 +744,10 @@ def send_discord_group(
             if product.get("retailer") != retailer:
                 continue
 
-            if reason == "Deal scoring enabled":
+            if reason in {
+                "Deal scoring enabled",
+                "Relevance gate enabled",
+            }:
                 reason_text = reason
             else:
                 reason_text = f"{reason}: {product['color']}"
@@ -763,7 +835,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.6 • "
+                        "Deal Hunter Server 0.7 • "
                         f"{len(retailer_products)} verified listings"
                     )
                 },
@@ -774,7 +846,7 @@ def send_discord_group(
     payload = {
         "username": "Deal Hunter",
         "content": (
-            "⚡ **Verified MacBook deals**\n"
+            "⚡ **Relevant MacBook deal alert**\n"
             "15-inch MacBook Air M5 • 24 GB • 1 TB"
         ),
         "embeds": embeds[:10],
@@ -1176,11 +1248,6 @@ def scan() -> None:
 
             exact_products.append(product)
 
-            reason = should_alert(product, state)
-
-            if reason:
-                triggered.append((product, reason))
-
         browser.close()
 
     for key in list(cache):
@@ -1230,9 +1297,36 @@ def scan() -> None:
         price_history,
     )
 
+    suppressed_new_matches = 0
+
+    for product in exact_products:
+        reason = should_alert(product, state)
+
+        if reason:
+            triggered.append((product, reason))
+            continue
+
+        if (
+            state.get(product["url"]) is None
+            and numeric_score(product.get("deal_score"))
+            < ALERT_MIN_SCORE
+        ):
+            suppressed_new_matches += 1
+
+    high_score_products = [
+        product
+        for product in exact_products
+        if (
+            product.get("availability") == "Likely in stock"
+            and numeric_score(product.get("deal_score"))
+            >= ALERT_MIN_SCORE
+        )
+    ]
+
     force_group_alert = (
         state.get("__group_alert_version__")
         != GROUP_ALERT_VERSION
+        and bool(high_score_products)
     )
 
     alert_needed = bool(triggered) or (
@@ -1250,7 +1344,7 @@ def scan() -> None:
                 for product, _ in grouped_reasons
             }
 
-            for product in exact_products:
+            for product in high_score_products:
                 retailer = product.get("retailer")
 
                 if retailer in retailers_with_reasons:
@@ -1259,7 +1353,7 @@ def scan() -> None:
                 grouped_reasons.append(
                     (
                         product,
-                        "Deal scoring enabled",
+                        "Relevance gate enabled",
                     )
                 )
                 retailers_with_reasons.add(retailer)
@@ -1320,6 +1414,9 @@ def scan() -> None:
         f"Best Buy exact matches: {best_buy_matches}",
         f"Total exact matches: {len(exact_products)}",
         f"Price history points added: {history_points_added}",
+        f"Alert score threshold: {ALERT_MIN_SCORE}/100",
+        f"Relevant alert events: {len(triggered)}",
+        f"Suppressed new matches: {suppressed_new_matches}",
         (
             "Best deal score: "
             + (
@@ -1350,7 +1447,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.6 starting.")
+    log("Deal Hunter Server 0.7 starting.")
 
     if not WEBHOOK_URL:
         log(
