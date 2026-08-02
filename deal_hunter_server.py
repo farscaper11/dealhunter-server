@@ -24,6 +24,16 @@ FULL_REVERIFY_HOURS = max(
     int(os.getenv("DH_FULL_REVERIFY_HOURS", "6")),
 )
 
+ENABLE_BH = os.getenv(
+    "DH_ENABLE_BH",
+    "false",
+).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 DATA_DIR = Path(os.getenv("DH_DATA_DIR", "/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,7 +97,7 @@ RETAILER_ORDER = {
 GROUP_ALERT_VERSION = 3
 
 USER_AGENT = (
-    "DealHunter/0.8 "
+    "DealHunter/0.8.1 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -839,7 +849,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.8 • "
+                        "Deal Hunter Server 0.8.1 • "
                         f"{len(retailer_products)} verified listings"
                     )
                 },
@@ -1138,46 +1148,52 @@ def scan() -> None:
             source_errors.append(message)
             log(message)
 
-        bh_context = browser.new_context(
-            locale="en-US",
-            viewport={
-                "width": 1440,
-                "height": 1100,
-            },
-        )
-        bh_page = bh_context.new_page()
-
-        try:
-            bh_candidates = bh_photo.discover_candidates(
-                bh_page
+        if ENABLE_BH:
+            bh_context = browser.new_context(
+                locale="en-US",
+                viewport={
+                    "width": 1440,
+                    "height": 1100,
+                },
             )
+            bh_page = bh_context.new_page()
 
-            for candidate in bh_candidates:
-                candidates.append(
-                    {
-                        "adapter": "bh_photo",
-                        "retailer": candidate.get(
-                            "retailer",
-                            "B&H Photo",
-                        ),
-                        "url": canonical_url(
-                            candidate.get("url", "")
-                        ),
-                        "text": candidate.get("text", ""),
-                        "page": bh_page,
-                    }
+            try:
+                bh_candidates = bh_photo.discover_candidates(
+                    bh_page
                 )
 
-            successful_retailers.add("B&H Photo")
-            log(
-                f"B&H candidates: "
-                f"{len(bh_candidates)}."
-            )
+                for candidate in bh_candidates:
+                    candidates.append(
+                        {
+                            "adapter": "bh_photo",
+                            "retailer": candidate.get(
+                                "retailer",
+                                "B&H Photo",
+                            ),
+                            "url": canonical_url(
+                                candidate.get("url", "")
+                            ),
+                            "text": candidate.get("text", ""),
+                            "page": bh_page,
+                        }
+                    )
 
-        except Exception as exc:
-            message = f"B&H catalog failed: {exc}"
-            source_errors.append(message)
-            log(message)
+                successful_retailers.add("B&H Photo")
+                log(
+                    f"B&H candidates: "
+                    f"{len(bh_candidates)}."
+                )
+
+            except Exception as exc:
+                message = f"B&H catalog failed: {exc}"
+                source_errors.append(message)
+                log(message)
+        else:
+            log(
+                "B&H source disabled: Cloudflare verification "
+                "blocks server-side access."
+            )
 
         deduped_candidates = []
         seen_urls = set()
@@ -1502,7 +1518,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.8 starting.")
+    log("Deal Hunter Server 0.8.1 starting.")
 
     if not WEBHOOK_URL:
         log(
