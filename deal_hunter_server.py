@@ -9,8 +9,10 @@ from urllib import request
 
 from playwright.sync_api import sync_playwright
 
+from retailers import best_buy
 
-CATALOG_URL = "https://www.apple.com/shop/refurbished/mac"
+
+APPLE_CATALOG_URL = "https://www.apple.com/shop/refurbished/mac"
 
 INTERVAL_MINUTES = max(
     5,
@@ -52,10 +54,15 @@ COLOR_ORDER = {
     "Sky Blue": 3,
 }
 
-GROUP_ALERT_VERSION = 1
+RETAILER_ORDER = {
+    "Apple Certified Refurbished": 0,
+    "Best Buy": 1,
+}
+
+GROUP_ALERT_VERSION = 2
 
 USER_AGENT = (
-    "DealHunter/0.4 "
+    "DealHunter/0.5 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -76,6 +83,18 @@ def canonical_url(url: str) -> str:
 def catalog_fingerprint(text: str) -> str:
     normalized = compact(text).lower()
     return sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def retailer_for_url(url: str) -> str:
+    lowered = (url or "").lower()
+
+    if "bestbuy.com" in lowered:
+        return "Best Buy"
+
+    if "apple.com" in lowered:
+        return "Apple Certified Refurbished"
+
+    return ""
 
 
 def load_cache() -> dict:
@@ -363,60 +382,76 @@ def send_discord_group(
         log("Discord webhook is not configured.")
         return
 
-    sorted_products = sorted(
-        products,
-        key=lambda item: (
-            item["price"],
-            COLOR_ORDER.get(item["color"], 99),
-        ),
-    )
+    grouped: dict[str, list[dict]] = {}
 
-    best = sorted_products[0]
-    prices = [product["price"] for product in sorted_products]
-    best_price = min(prices)
+    for product in products:
+        retailer = product.get("retailer", "Unknown retailer")
+        grouped.setdefault(retailer, []).append(product)
 
-    color_lines = []
+    embeds = []
 
-    for product in sorted_products:
-        clean_url = canonical_url(product["url"])
-
-        color_lines.append(
-            f"{availability_icon(product['availability'])} "
-            f"[{product['color']} — ${product['price']:,.0f}]"
-            f"({clean_url})"
+    for retailer in sorted(
+        grouped,
+        key=lambda name: RETAILER_ORDER.get(name, 99),
+    ):
+        retailer_products = sorted(
+            grouped[retailer],
+            key=lambda item: (
+                item["price"],
+                COLOR_ORDER.get(item["color"], 99),
+            ),
         )
-    reason_lines = []
-    seen_reasons = set()
 
-    for product, reason in triggered:
-        if reason == "Grouped alert format enabled":
-            reason_text = reason
-        else:
-            reason_text = f"{reason}: {product['color']}"
+        best = retailer_products[0]
+        best_price = min(
+            product["price"]
+            for product in retailer_products
+        )
 
-        if reason_text in seen_reasons:
-            continue
+        listing_lines = []
 
-        seen_reasons.add(reason_text)
-        reason_lines.append(f"• {reason_text}")
+        for product in retailer_products:
+            listing_lines.append(
+                f"{availability_icon(product['availability'])} "
+                f"[{product['color']} — ${product['price']:,.0f}]"
+                f"({canonical_url(product['url'])})"
+            )
 
-    if not reason_lines:
-        reason_lines.append("• Verified color lineup")
+        reason_lines = []
+        seen_reasons = set()
 
-    payload = {
-        "username": "Deal Hunter",
-        "content": "⚡ **Verified MacBook deal**",
-        "embeds": [
+        for product, reason in triggered:
+            if product.get("retailer") != retailer:
+                continue
+
+            if reason == "Multi-retailer alert enabled":
+                reason_text = reason
+            else:
+                reason_text = f"{reason}: {product['color']}"
+
+            if reason_text in seen_reasons:
+                continue
+
+            seen_reasons.add(reason_text)
+            reason_lines.append(f"• {reason_text}")
+
+        if not reason_lines:
+            reason_lines.append("• Verified retailer lineup")
+
+        condition = best.get("condition", "Verified")
+        in_stock = sum(
+            product["availability"] == "Likely in stock"
+            for product in retailer_products
+        )
+
+        embeds.append(
             {
-                "title": (
-                    "15-inch MacBook Air M5 — "
-                    "24 GB / 1 TB"
-                ),
+                "title": f"{retailer} — ${best_price:,.0f} best",
                 "url": canonical_url(best["url"]),
                 "description": (
-                    "**Apple Certified Refurbished**\n"
+                    f"**{condition}**\n"
                     "Every link below was opened and verified "
-                    "against the actual product page."
+                    "against the retailer product page."
                 ),
                 "fields": [
                     {
@@ -426,39 +461,42 @@ def send_discord_group(
                     },
                     {
                         "name": "Verified colors",
-                        "value": str(len(sorted_products)),
+                        "value": str(len(retailer_products)),
                         "inline": True,
                     },
                     {
                         "name": "Availability",
-                        "value": (
-                            f"{sum(
-                                product['availability'] == 'Likely in stock'
-                                for product in sorted_products
-                            )} in stock"
-                        ),
+                        "value": f"{in_stock} in stock",
                         "inline": True,
                     },
                     {
-                        "name": "Choose a color",
-                        "value": "\n".join(color_lines),
+                        "name": "Choose a listing",
+                        "value": "\n".join(listing_lines)[:1024],
                         "inline": False,
                     },
                     {
                         "name": "Why now",
-                        "value": "\n".join(reason_lines),
+                        "value": "\n".join(reason_lines)[:1024],
                         "inline": False,
                     },
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.4 • "
-                        f"{len(sorted_products)} verified listings"
+                        "Deal Hunter Server 0.5 • "
+                        f"{len(retailer_products)} verified listings"
                     )
                 },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        ],
+        )
+
+    payload = {
+        "username": "Deal Hunter",
+        "content": (
+            "⚡ **Verified MacBook deals**\n"
+            "15-inch MacBook Air M5 • 24 GB • 1 TB"
+        ),
+        "embeds": embeds[:10],
     }
 
     body = json.dumps(payload).encode("utf-8")
@@ -480,7 +518,7 @@ def send_discord_group(
     ) as response:
         log(f"Discord returned HTTP {response.status}.")
 
-def scan_product_page(page, url: str) -> dict:
+def scan_apple_product_page(page, url: str) -> dict:
     page.goto(
         url,
         wait_until="domcontentloaded",
@@ -545,6 +583,8 @@ def scan_product_page(page, url: str) -> dict:
         availability = "Unknown"
 
     product = {
+        "retailer": "Apple Certified Refurbished",
+        "condition": "Refurbished",
         "title": str(
             structured_product.get("name") or title
         ),
@@ -580,7 +620,7 @@ def scan_product_page(page, url: str) -> dict:
 
 
 def scan() -> None:
-    log("Opening Apple refurbished catalog.")
+    log("Opening retailer catalogs.")
 
     state = load_state()
     normalize_state_urls(state)
@@ -589,6 +629,9 @@ def scan() -> None:
     results = []
     exact_products = []
     triggered = []
+    candidates = []
+    source_errors = []
+    successful_retailers = set()
 
     pages_opened = 0
     cached_pages = 0
@@ -600,103 +643,172 @@ def scan() -> None:
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
 
-        context = browser.new_context(
+        apple_context = browser.new_context(
             locale="en-US",
             viewport={
                 "width": 1440,
                 "height": 1100,
             },
         )
-
-        page = context.new_page()
-
-        page.goto(
-            CATALOG_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        apple_page = apple_context.new_page()
 
         try:
-            page.wait_for_load_state(
-                "networkidle",
-                timeout=12000,
+            apple_page.goto(
+                APPLE_CATALOG_URL,
+                wait_until="domcontentloaded",
+                timeout=60000,
             )
-        except Exception:
-            pass
 
-        page.wait_for_timeout(2500)
-
-        raw_links = page.evaluate(
-            """
-            () => {
-              const results = [];
-
-              for (
-                const link of document.querySelectorAll(
-                  'a[href*="/shop/product/"]'
+            try:
+                apple_page.wait_for_load_state(
+                    "networkidle",
+                    timeout=12000,
                 )
-              ) {
-                const url = link.href;
+            except Exception:
+                pass
 
-                if (!url) continue;
+            apple_page.wait_for_timeout(2500)
 
-                const container =
-                  link.closest(
-                    'li, article, [class*="product"], [class*="card"]'
-                  ) ||
-                  link.parentElement;
+            raw_links = apple_page.evaluate(
+                """
+                () => {
+                  const results = [];
 
-                const text = (
-                  container?.innerText ||
-                  link.innerText ||
-                  ""
-                ).trim();
+                  for (
+                    const link of document.querySelectorAll(
+                      'a[href*="/shop/product/"]'
+                    )
+                  ) {
+                    const url = link.href;
 
-                if (!/macbook air/i.test(text)) continue;
-                if (!/15(?:\\.3)?[- ]?inch/i.test(text)) continue;
-                if (!/\\bm5\\b/i.test(text)) continue;
+                    if (!url) continue;
 
-                results.push({
-                  url,
-                  text
-                });
-              }
+                    const container =
+                      link.closest(
+                        'li, article, [class*="product"], [class*="card"]'
+                      ) ||
+                      link.parentElement;
 
-              return results;
-            }
-            """
+                    const text = (
+                      container?.innerText ||
+                      link.innerText ||
+                      ""
+                    ).trim();
+
+                    if (!/macbook air/i.test(text)) continue;
+                    if (!/15(?:\\.3)?[- ]?inch/i.test(text)) continue;
+                    if (!/\\bm5\\b/i.test(text)) continue;
+
+                    results.push({url, text});
+                  }
+
+                  return results;
+                }
+                """
+            )
+
+            seen_apple_urls = set()
+
+            for link in raw_links:
+                clean_url = canonical_url(link.get("url", ""))
+
+                if not clean_url or clean_url in seen_apple_urls:
+                    continue
+
+                seen_apple_urls.add(clean_url)
+                candidates.append(
+                    {
+                        "adapter": "apple",
+                        "retailer": "Apple Certified Refurbished",
+                        "url": clean_url,
+                        "text": link.get("text", ""),
+                        "page": apple_page,
+                    }
+                )
+
+            successful_retailers.add(
+                "Apple Certified Refurbished"
+            )
+            log(
+                f"Apple candidates: {len(seen_apple_urls)}."
+            )
+
+        except Exception as exc:
+            message = f"Apple catalog failed: {exc}"
+            source_errors.append(message)
+            log(message)
+
+        best_buy_context = browser.new_context(
+            locale="en-US",
+            viewport={
+                "width": 1440,
+                "height": 1100,
+            },
         )
+        best_buy_page = best_buy_context.new_page()
 
-        links = []
+        try:
+            best_buy_candidates = best_buy.discover_candidates(
+                best_buy_page
+            )
+
+            for candidate in best_buy_candidates:
+                candidates.append(
+                    {
+                        "adapter": "best_buy",
+                        "retailer": candidate.get(
+                            "retailer",
+                            "Best Buy",
+                        ),
+                        "url": canonical_url(
+                            candidate.get("url", "")
+                        ),
+                        "text": candidate.get("text", ""),
+                        "page": best_buy_page,
+                    }
+                )
+
+            successful_retailers.add("Best Buy")
+            log(
+                f"Best Buy candidates: "
+                f"{len(best_buy_candidates)}."
+            )
+
+        except Exception as exc:
+            message = f"Best Buy catalog failed: {exc}"
+            source_errors.append(message)
+            log(message)
+
+        deduped_candidates = []
         seen_urls = set()
 
-        for link in raw_links:
-            clean_url = canonical_url(link.get("url", ""))
+        for candidate in candidates:
+            url = candidate["url"]
 
-            if not clean_url or clean_url in seen_urls:
+            if not url or url in seen_urls:
                 continue
 
-            seen_urls.add(clean_url)
+            seen_urls.add(url)
+            deduped_candidates.append(candidate)
 
-            links.append(
-                {
-                    "url": clean_url,
-                    "text": link.get("text", ""),
-                }
-            )
-
+        candidates = deduped_candidates
         catalog_urls = {
-            link["url"]
-            for link in links
+            candidate["url"]
+            for candidate in candidates
         }
 
         log(
-            f"Found {len(links)} candidate product pages."
+            f"Found {len(candidates)} total candidate pages."
         )
 
-        for index, link in enumerate(links, start=1):
-            url = link["url"]
-            fingerprint = catalog_fingerprint(link["text"])
+        for index, candidate in enumerate(
+            candidates,
+            start=1,
+        ):
+            url = candidate["url"]
+            fingerprint = catalog_fingerprint(
+                candidate["text"]
+            )
 
             cached_entry = cache.get(url, {})
             cached_product = cached_entry.get("product")
@@ -740,13 +852,20 @@ def scan() -> None:
             if should_open:
                 try:
                     log(
-                        f"Opening product {index}/{len(links)}."
+                        f"Opening {candidate['retailer']} "
+                        f"product {index}/{len(candidates)}."
                     )
 
-                    product = scan_product_page(
-                        page,
-                        url,
-                    )
+                    if candidate["adapter"] == "best_buy":
+                        product = best_buy.verify_product(
+                            candidate["page"],
+                            url,
+                        )
+                    else:
+                        product = scan_apple_product_page(
+                            candidate["page"],
+                            url,
+                        )
 
                     pages_opened += 1
 
@@ -758,8 +877,7 @@ def scan() -> None:
 
                 except Exception as exc:
                     log(
-                        f"Product page failed: "
-                        f"{url}: {exc}"
+                        f"Product page failed: {url}: {exc}"
                     )
                     continue
 
@@ -783,7 +901,18 @@ def scan() -> None:
         browser.close()
 
     for key in list(cache):
-        if key not in catalog_urls:
+        if key in catalog_urls:
+            continue
+
+        cached_entry = cache.get(key, {})
+        cached_product = cached_entry.get("product", {})
+        retailer = (
+            cached_product.get("retailer")
+            if isinstance(cached_product, dict)
+            else ""
+        ) or retailer_for_url(key)
+
+        if retailer in successful_retailers:
             del cache[key]
 
     for key, previous in list(state.items()):
@@ -794,6 +923,14 @@ def scan() -> None:
             continue
 
         if not isinstance(previous, dict):
+            continue
+
+        retailer = (
+            previous.get("retailer")
+            or retailer_for_url(key)
+        )
+
+        if retailer not in successful_retailers:
             continue
 
         if previous.get("availability") == "Likely in stock":
@@ -812,15 +949,27 @@ def scan() -> None:
     alert_sent = not alert_needed
 
     if alert_needed:
-        grouped_reasons = triggered
+        grouped_reasons = list(triggered)
 
-        if force_group_alert and not grouped_reasons:
-            grouped_reasons = [
-                (
-                    exact_products[0],
-                    "Grouped alert format enabled",
+        if force_group_alert:
+            retailers_with_reasons = {
+                product.get("retailer")
+                for product, _ in grouped_reasons
+            }
+
+            for product in exact_products:
+                retailer = product.get("retailer")
+
+                if retailer in retailers_with_reasons:
+                    continue
+
+                grouped_reasons.append(
+                    (
+                        product,
+                        "Multi-retailer alert enabled",
+                    )
                 )
-            ]
+                retailers_with_reasons.add(retailer)
 
         try:
             send_discord_group(
@@ -834,6 +983,7 @@ def scan() -> None:
     if alert_sent:
         for product in exact_products:
             state[product["url"]] = {
+                "retailer": product.get("retailer"),
                 "price": product["price"],
                 "availability": product["availability"],
                 "last_seen": product["checked_at"],
@@ -852,18 +1002,39 @@ def scan() -> None:
         encoding="utf-8",
     )
 
-    exact_count = len(exact_products)
-
-    summary = (
-        f"Checked: "
-        f"{datetime.now().astimezone().isoformat()}\n"
-        f"Candidate pages: {len(links)}\n"
-        f"Product pages opened: {pages_opened}\n"
-        f"Cached pages reused: {cached_pages}\n"
-        f"Exact matches: {exact_count}\n"
-        f"Grouped alert sent: "
-        f"{'yes' if alert_needed and alert_sent else 'no'}\n"
+    apple_matches = sum(
+        product.get("retailer")
+        == "Apple Certified Refurbished"
+        for product in exact_products
     )
+    best_buy_matches = sum(
+        product.get("retailer") == "Best Buy"
+        for product in exact_products
+    )
+
+    summary_lines = [
+        (
+            "Checked: "
+            f"{datetime.now().astimezone().isoformat()}"
+        ),
+        f"Total candidate pages: {len(candidates)}",
+        f"Product pages opened: {pages_opened}",
+        f"Cached pages reused: {cached_pages}",
+        f"Apple exact matches: {apple_matches}",
+        f"Best Buy exact matches: {best_buy_matches}",
+        f"Total exact matches: {len(exact_products)}",
+        (
+            "Grouped alert sent: "
+            f"{'yes' if alert_needed and alert_sent else 'no'}"
+        ),
+    ]
+
+    if source_errors:
+        summary_lines.append(
+            f"Retailer errors: {len(source_errors)}"
+        )
+
+    summary = "\n".join(summary_lines) + "\n"
 
     SCAN_FILE.write_text(
         summary,
@@ -873,7 +1044,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.4 starting.")
+    log("Deal Hunter Server 0.5 starting.")
 
     if not WEBHOOK_URL:
         log(
