@@ -334,13 +334,13 @@ def send_discord_group(
     color_lines = []
 
     for product in sorted_products:
-    clean_url = product["url"].split("?", 1)[0]
+        clean_url = product["url"].split("?", 1)[0]
 
-    color_lines.append(
-        f"{availability_icon(product['availability'])} "
-        f"[{product['color']} — ${product['price']:,.0f}]"
-        f"({clean_url})"
-    )
+        color_lines.append(
+            f"{availability_icon(product['availability'])} "
+            f"[{product['color']} — ${product['price']:,.0f}]"
+            f"({clean_url})"
+        )
     reason_lines = []
     seen_reasons = set()
 
