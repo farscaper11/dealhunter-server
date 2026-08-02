@@ -9,7 +9,7 @@ from urllib import request
 
 from playwright.sync_api import sync_playwright
 
-from retailers import best_buy
+from retailers import best_buy, bh_photo
 
 
 APPLE_CATALOG_URL = "https://www.apple.com/shop/refurbished/mac"
@@ -81,12 +81,13 @@ COLOR_ORDER = {
 RETAILER_ORDER = {
     "Apple Certified Refurbished": 0,
     "Best Buy": 1,
+    "B&H Photo": 2,
 }
 
 GROUP_ALERT_VERSION = 3
 
 USER_AGENT = (
-    "DealHunter/0.7 "
+    "DealHunter/0.8 "
     "(+https://github.com/farscaper11/dealhunter-server)"
 )
 
@@ -114,6 +115,9 @@ def retailer_for_url(url: str) -> str:
 
     if "bestbuy.com" in lowered:
         return "Best Buy"
+
+    if "bhphotovideo.com" in lowered:
+        return "B&H Photo"
 
     if "apple.com" in lowered:
         return "Apple Certified Refurbished"
@@ -835,7 +839,7 @@ def send_discord_group(
                 ],
                 "footer": {
                     "text": (
-                        "Deal Hunter Server 0.7 • "
+                        "Deal Hunter Server 0.8 • "
                         f"{len(retailer_products)} verified listings"
                     )
                 },
@@ -1134,6 +1138,47 @@ def scan() -> None:
             source_errors.append(message)
             log(message)
 
+        bh_context = browser.new_context(
+            locale="en-US",
+            viewport={
+                "width": 1440,
+                "height": 1100,
+            },
+        )
+        bh_page = bh_context.new_page()
+
+        try:
+            bh_candidates = bh_photo.discover_candidates(
+                bh_page
+            )
+
+            for candidate in bh_candidates:
+                candidates.append(
+                    {
+                        "adapter": "bh_photo",
+                        "retailer": candidate.get(
+                            "retailer",
+                            "B&H Photo",
+                        ),
+                        "url": canonical_url(
+                            candidate.get("url", "")
+                        ),
+                        "text": candidate.get("text", ""),
+                        "page": bh_page,
+                    }
+                )
+
+            successful_retailers.add("B&H Photo")
+            log(
+                f"B&H candidates: "
+                f"{len(bh_candidates)}."
+            )
+
+        except Exception as exc:
+            message = f"B&H catalog failed: {exc}"
+            source_errors.append(message)
+            log(message)
+
         deduped_candidates = []
         seen_urls = set()
 
@@ -1213,6 +1258,11 @@ def scan() -> None:
 
                     if candidate["adapter"] == "best_buy":
                         product = best_buy.verify_product(
+                            candidate["page"],
+                            url,
+                        )
+                    elif candidate["adapter"] == "bh_photo":
+                        product = bh_photo.verify_product(
                             candidate["page"],
                             url,
                         )
@@ -1401,6 +1451,10 @@ def scan() -> None:
         product.get("retailer") == "Best Buy"
         for product in exact_products
     )
+    bh_matches = sum(
+        product.get("retailer") == "B&H Photo"
+        for product in exact_products
+    )
 
     summary_lines = [
         (
@@ -1412,6 +1466,7 @@ def scan() -> None:
         f"Cached pages reused: {cached_pages}",
         f"Apple exact matches: {apple_matches}",
         f"Best Buy exact matches: {best_buy_matches}",
+        f"B&H exact matches: {bh_matches}",
         f"Total exact matches: {len(exact_products)}",
         f"Price history points added: {history_points_added}",
         f"Alert score threshold: {ALERT_MIN_SCORE}/100",
@@ -1447,7 +1502,7 @@ def scan() -> None:
     log(summary.strip())
 
 def main() -> None:
-    log("Deal Hunter Server 0.7 starting.")
+    log("Deal Hunter Server 0.8 starting.")
 
     if not WEBHOOK_URL:
         log(
