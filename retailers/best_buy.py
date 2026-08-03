@@ -106,37 +106,47 @@ def detect_color(text: str) -> str:
     return ""
 
 
-def extract_best_buy_price(card_text: str) -> float | None:
-    normalized = compact(card_text)
+def parse_first_price(text: str) -> float | None:
+    match = re.search(
+        r"\$\s*([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
+        compact(text),
+    )
 
-    # Exclude comparison/MSRP text so it cannot be mistaken for the live price.
-    live_price_section = re.split(
-        r"\b(?:The comparable value is|Comp\.?\s*Value|Was Price)\b",
+    if not match:
+        return None
+
+    try:
+        value = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+    return value if 500 <= value <= 5000 else None
+
+
+def extract_best_buy_price(
+    primary_price_text: str,
+    card_text: str,
+) -> float | None:
+    # The dedicated customer-price element contains the primary condition's
+    # live price. Do not take the minimum across the whole card: Best Buy can
+    # place cheaper refurbished/open-box prices under "More Buying Options."
+    primary_price = parse_first_price(primary_price_text)
+
+    if primary_price is not None:
+        return primary_price
+
+    # Defensive fallback for markup changes. Stop before alternate-condition
+    # and comparison-price sections, then use the first live price shown.
+    normalized = compact(card_text)
+    primary_section = re.split(
+        r"\b(?:More Buying Options|Open-Box|Refurbished|Pre-Owned|"
+        r"The comparable value is|Comp\.?\s*Value|Was Price)\b",
         normalized,
         maxsplit=1,
         flags=re.I,
     )[0]
 
-    values: list[float] = []
-
-    for raw in re.findall(
-        r"\$\s*([0-9]{1,2}(?:,[0-9]{3})+(?:\.\d{2})?)",
-        live_price_section,
-    ):
-        try:
-            value = float(raw.replace(",", ""))
-        except ValueError:
-            continue
-
-        if 500 <= value <= 5000:
-            values.append(value)
-
-    if not values:
-        return None
-
-    # Best Buy often renders the current price twice. min() also handles
-    # a lower member/deal price appearing alongside the regular price.
-    return min(values)
+    return parse_first_price(primary_section)
 
 
 def detect_availability(card_text: str) -> str:
@@ -256,11 +266,24 @@ def discover_candidates(page) -> list[dict]:
               ).replace(/\\s+/g, ' ').trim())
               .filter(Boolean);
 
+            const primaryPriceElement =
+              card.querySelector(
+                '[data-testid="price-block-customer-price"]'
+              ) ||
+              card.querySelector(
+                '[data-testid="price-block-content"]'
+              );
+
+            const primaryPriceText = (
+              primaryPriceElement?.innerText || ''
+            ).replace(/\\s+/g, ' ').trim();
+
             results.push({
               url: link.href,
               title,
               text,
-              buttons
+              buttons,
+              primaryPriceText
             });
           }
 
@@ -291,6 +314,9 @@ def discover_candidates(page) -> list[dict]:
                 for button in candidate.get("buttons", [])
                 if compact(button)
             ],
+            "primary_price_text": compact(
+                candidate.get("primaryPriceText", "")
+            ),
         }
 
         _CANDIDATE_CACHE[url] = normalized
@@ -337,10 +363,15 @@ def verify_product(page, url: str) -> dict:
         "memory": detect_memory(title),
         "storage": detect_storage(title),
         "color": detect_color(title),
-        "price": extract_best_buy_price(card_text),
+        "price": extract_best_buy_price(
+            candidate.get("primary_price_text", ""),
+            card_text,
+        ),
         "availability": detect_availability(card_text),
         "sold_by_retailer": sold_by_best_buy(card_text),
-        "verification_source": "Best Buy live search-result card",
+        "verification_source": (
+            "Best Buy primary live search-card offer"
+        ),
         "checked_at": datetime.now()
         .astimezone()
         .isoformat(timespec="seconds"),
